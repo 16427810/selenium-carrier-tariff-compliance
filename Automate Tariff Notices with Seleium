@@ -1,0 +1,367 @@
+import pycountry
+import pandas as pd
+import numpy as np
+import time
+import re
+from datetime import datetime
+from dateutil import parser
+from chrome_setup import init_browser, handle_cookies
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+
+class MaerskScraper:
+    def __init__(self):
+        self.driver = None
+        self.wait = None
+        self.notices = []
+
+    def extract_effective_date(self, body_text):
+        lower_body = body_text.lower()
+        
+        # Regex patterns to find snippets containing dates
+        patterns = [
+           r"effective\s+(?:from\s+)?([^\n]{0,40})",
+           r"effect\s+(?:from\s+)?([^\n]{0,40})",
+            r"effective\s+(?:the\s+)?([^\n]{0,40})",
+            r"(?:effective\s+price\s+calculation\s+date\s+)([^\n]{0,40})",
+            r"(?:regulated.*?)\b(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s+\d{2,4})",
+            r"(?:regulated.*?)\b(\w+\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{2,4})",
+            r"(?:regulated.*?)\b(\d{1,2}[-\s]?\w+[-\s]?\d{2,4})",
+            r"date\s+(?:is\s+)?([^\n]{0,40})",
+            r"starting from\s+([^\n]{0,40})",
+            r"as of\s+([^\n]{0,40})",
+            r"changing\s+on\s+([^\n]{0,40})",
+            r"on\s+(\d{1,2}\s+\w+,?\s+\d{2,4})",
+            r"from\s+(\d{1,2}[\-/]\w+[\-/]\d{2,4})",
+            r"\beffective from\s+(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s+'?\d{2,4})",
+            r"\bFMC countries.*?(\d{1,2}\w*\s+\w+\s+'\d{2})",
+            r"\bRegulated countries.*?(\d{1,2}\w*\s+\w+\s+'\d{2})"
+        ]
+
+        # Inner patterns to extract actual dates from snippets
+        date_patterns = [
+            r"\b\d{1,2}(?:st|nd|rd|th|of)?(?:\s+of)?\s+[A-Za-z]+\s+\d{2,4}\b",
+            r"\b\d{1,2}[\-/]\s?[A-Za-z]+[\-/]\d{2,4}\b",
+            r"\b[A-Za-z]+\s+\d{1,2},?\s+\d{2,4}\b",
+            r"\b\d{1,2}(?:st|nd|rd|th|of)?[\s\-]+[A-Za-z]+[\s\-]+\'?\d{2,4}\b",  
+            r"\b[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th|of)?,?\s+\'?\d{2,4}\b",        
+            r"\b\d{1,2}[\s\-]+[A-Za-z]+[\s\-]+'?\d{2,4}\b"    
+        ]
+
+        extracted_dates = []
+
+        for pattern in patterns:
+            # Find ALL matches (not just the first)
+            for match in re.finditer(pattern, lower_body, re.IGNORECASE):
+                snippet = match.group(1).strip()
+                for dp in date_patterns:
+                    # Extract ALL dates from the snippet
+                    for date_match in re.finditer(dp, snippet, re.IGNORECASE):
+                        clean_str = re.sub(r"(st|nd|rd|th|of)", "", date_match.group(), flags=re.IGNORECASE)
+                        try:
+                            parsed_date = parser.parse(clean_str, fuzzy=True, dayfirst=True)
+                            extracted_dates.append(parsed_date)
+                        except:
+                            continue
+
+        if extracted_dates:
+            return max(extracted_dates).strftime("%d %b %Y")  # Returns the latest date
+        return None
+
+    def extract_locations(self, text):
+        found = set()
+        text_lower = text.lower()
+
+        # Direct pycountry matches
+        for country in pycountry.countries:
+            if country.name.lower() in text_lower:
+                found.add(country.name)
+
+        # Manual aliases
+        aliases = {
+            "USA": "United States",
+            "US ": "United States",
+            "US,": "United States",
+            "U.S.": "United States",
+            "U.S.A.": "United States",
+            "united states of america": "United States",
+            "UNITED STATES OF AMERICA": "United States",
+            "United States of America": "United States"
+        }
+
+        for alias, standard in aliases.items():
+            if alias in text:
+                found.add(standard)
+
+        if "world" in text_lower:
+            found.add("World")
+
+        return list(found)
+
+    def extract_notice_date(self):
+        try:
+            # Try the standard date first
+            date_text = self.driver.find_element(By.CSS_SELECTOR, "div.p-section__article__meta__date").text.strip()
+            if "updated" in date_text.lower():
+                # Remove the 'Updated' prefix if present
+                date_text = date_text.replace("Updated", "").strip()
+            return date_text
+        except:
+            return ""
+
+    def process_notice_card(self, i):
+        """Click a card and extract data with guaranteed title capture"""
+        try:
+            # Wait for cards to load
+            cards = self.wait.until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.p-section__news__teaser")))
+            if i >= len(cards):
+                return None
+
+            card = cards[i]
+            
+            # PRECISE TITLE EXTRACTION ======================================
+            title_text = "No Title Extracted"
+            click_target = None
+            
+            # Method 1: Standard title extraction (works for 90% of cases)
+            try:
+                title_span = card.find_element(By.CSS_SELECTOR, "span.p-section__news__teaser__title__line")
+                title_text = title_span.get_attribute("title") or title_span.text.strip()
+                click_target = card.find_element(By.CSS_SELECTOR, "a.p-section__news__teaser__title")
+            except:
+                # Method 2: Fallback to direct link text (catches edge cases)
+                try:
+                    title_link = card.find_element(By.CSS_SELECTOR, "a.p-section__news__teaser__title")
+                    title_text = title_link.text.strip()
+                    click_target = title_link
+                except:
+                    # Method 3: Nuclear option - get from URL slug
+                    try:
+                        click_target = card.find_element(By.TAG_NAME, "a")
+                        title_text = click_target.get_attribute("href").split('/')[-1].replace('-', ' ').title()
+                    except Exception as e:
+                        print(f"⚠️ Title extraction failed for card {i+1}: {str(e)}")
+                        return None
+            # ==============================================================
+
+            # Scroll and click
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", click_target)
+            click_target.click()
+            
+            # Wait for detail page
+            self.wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "h1.p-section__article__meta__title")))
+            time.sleep(0.3)  # Small stabilization pause
+
+            notice = {
+                "Title": title_text,
+                "Notice Date": self.extract_notice_date(),
+                "Effective Date": self.extract_effective_date(self.driver.find_element(By.CSS_SELECTOR, "div.rich-text").text.strip()),
+                "Locations": ", ".join(self.extract_locations(self.driver.find_element(By.CSS_SELECTOR, "div.rich-text").text.strip())),
+                "Notice Content": self.driver.find_element(By.CSS_SELECTOR, "div.rich-text").text.strip(),
+                "URL": self.driver.current_url
+            }
+
+            print(f"✅ Collected {i+1}: {notice['Title']}")
+            return notice
+
+        except Exception as e:
+            print(f"❌ Error on card {i+1}: {str(e)}")
+            return None
+        finally:
+            try:
+                self.driver.back()
+                self.wait.until(EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "div.p-section__news__teaser")))
+                time.sleep(0.5)
+            except:
+                try:
+                    self.driver.refresh()
+                    time.sleep(1)
+                except:
+                    pass
+
+    def reload_required_cards(self, card_index, max_load_more_clicks, cards_per_load):
+        """Reset cards and click 'Load More' as needed for current card"""
+        # Always start from base 12 cards
+        current_loads = 0
+        
+        while current_loads * cards_per_load <= card_index and current_loads <= max_load_more_clicks:
+            try:
+                cards = self.driver.find_elements(By.CSS_SELECTOR, "div.p-section__news__teaser")
+                if card_index < len(cards):
+                    break
+                
+                load_more = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button.button")))
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", load_more)
+                load_more.click()
+                current_loads += 1
+                print(f"🔄 Loaded more cards (Click {current_loads} of {max_load_more_clicks})")
+                time.sleep(2)
+            except:
+                print(f"⚠️ Load More failed once, retrying...")
+                try:
+                    time.sleep(1)
+                    load_more = WebDriverWait(self.driver, 3).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "button.button"))
+                    )
+                    load_more.click()
+                    print(f"✅ Retry succeeded (Click {current_loads + 1})")
+                    time.sleep(2)
+                    current_loads += 1
+                except:
+                    print(f"❌ Gave up loading more for card {card_index + 1}")
+                    break
+
+    def scrape_announcements(self, max_load_more_clicks=1):
+        self.driver, self.wait = init_browser()
+        self.driver.get("https://www.maersk.com/news/filter?category=Rate%20announcements")
+        handle_cookies(self.driver)
+        print("✅ Page loaded.")
+
+        self.notices = []
+        cards_per_load = 12
+
+        for i in range((max_load_more_clicks + 1) * cards_per_load):
+            try:
+                # Re-establish card list after each back() navigation
+                self.reload_required_cards(i, max_load_more_clicks, cards_per_load)
+                
+                cards = self.driver.find_elements(By.CSS_SELECTOR, "div.p-section__news__teaser")
+                if i >= len(cards):
+                    print(f"⚠️ Card {i+1} not available after loading")
+                    continue
+
+                notice = self.process_notice_card(i)
+                if notice:
+                    self.notices.append(notice)
+                    print(f"✔ Collected card {i+1}: {notice.get('Title', 'No title')[:50]}...")
+            except Exception as e:
+                print(f"❌ Error on card {i+1}: {str(e)}")
+
+        self.driver.quit()
+        return self.notices
+
+    def analyze_and_save_notices(self):
+        if not self.notices:
+            print("⚠️ No notices to process.")
+            return
+        
+        df = pd.DataFrame(self.notices).drop_duplicates()
+
+        # Normalize text for analysis
+        df['locations_lower'] = df['Locations'].astype(str).str.lower()
+        df['notice_content_lower'] = df['Notice Content'].astype(str).str.lower()
+
+        # Define keyword sets
+        us_keywords = [
+            'united states', 
+            'puerto rico', 'guam', 'american samoa', 'northern mariana islands',
+            'u.s. virgin islands', 'us virgin islands', 'virgin islands of the united states',
+            'hawaii', 'alaska', 'american territory', 'american territories', 'world'
+        ]
+        rate_keywords = ['surcharge', 'surcharges', 'rate increase', 
+                         'increase rate', 'rate rise', 'increased tariffs',
+                         "additional cost"]
+
+        # Helper function: match any keyword as whole word using regex
+        def contains_whole_word(text, keywords):
+            return any(re.search(rf'\b{re.escape(kw)}\b', text, flags=re.IGNORECASE) for kw in keywords)
+
+        # Apply clean match logic
+        df['affects_us_region'] = df.apply(lambda row: contains_whole_word(str(row['Locations']), us_keywords) or 'world' in str(row['Title']).lower(),axis=1)
+        df['rate_increase'] = df['Notice Content'].apply(lambda x: contains_whole_word(str(x), rate_keywords))
+
+        # Clean effective date string (remove st/nd/rd/th/of)
+        def clean_date_str(raw):
+            try:
+                raw = raw.lower()
+                for suffix in ['st', 'nd', 'rd', 'th', 'of']:
+                    raw = raw.replace(suffix, '')
+                return raw.strip()
+            except:
+                return raw
+
+        df['cleaned_effective_date'] = df['Effective Date'].apply(clean_date_str)
+
+        # Convert to datetime and calculate date gap
+        def compute_gap(row):
+            try:
+                effective = pd.to_datetime(row['cleaned_effective_date'], dayfirst=True, errors='coerce')
+                notice = pd.to_datetime(row['Notice Date'], dayfirst=True, errors='coerce')
+
+                if pd.isna(effective) or pd.isna(notice):
+                    return None  # return actual null for consistency
+
+                return (effective - notice).days
+
+            except Exception:
+                return None  # also return null on error
+
+        df['date_gap'] = df.apply(compute_gap, axis=1)
+
+        # Flagging
+        def flag_row(row):
+            if row['affects_us_region'] and row['rate_increase']:
+                if pd.isna(row['date_gap']):
+                    return "Please review - unclear effective date"
+                elif row['date_gap'] < 30:
+                    return "Violation"
+                else:
+                    return "Comply"
+            return "Not subject to 30-day rule"
+
+        df['flag'] = df.apply(flag_row, axis=1)
+
+        # Final formatting: match date format in notice date and cleaned effective date
+        def format_date(d):
+            try:
+                return pd.to_datetime(d, dayfirst=True).strftime("%d %b %Y")
+            except:
+                return d
+
+        df['cleaned_effective_date'] = df['cleaned_effective_date'].apply(format_date)
+        df['Notice Date'] = pd.to_datetime(df['Notice Date'], dayfirst=True, errors='coerce').dt.strftime("%d %b %Y")
+        df['carrier_name'] = 'Maersk'
+        
+        # Reorder columns for readability
+        columns_order = [
+            "carrier_name", "Title", "Notice Date", "Effective Date", "date_gap",
+            "Locations", "Notice Content", "URL", "affects_us_region", "rate_increase", "flag"
+        ]
+        df = df[[col for col in columns_order if col in df.columns]]
+        df.columns = df.columns.str.lower()
+        df = df.rename(columns={
+                        'notice date': 'notice_date',
+                        'effective date': 'effective_date',
+                        'notice content': 'notice_content'
+        }) 
+        df['effective_date'] = df['effective_date'].astype(str).str.upper()
+        df['notice_date'] = df['notice_date'].astype(str).str.upper()
+        df['effective_date'] = df['effective_date'].replace('NONE', np.nan)
+
+        # Then apply the same logic
+        mask = (
+            (df['affects_us_region'] == True) & 
+            (df['rate_increase'] == True) & 
+            df['effective_date'].isna()
+        )
+        df.loc[mask, 'effective_date'] = ''
+        df = df.drop_duplicates()
+
+        # Save to file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"maersk_notice_data_{timestamp}.xlsx"
+        df.to_excel(filename, index=False)
+        print(f"📄 Saved {len(df)} notices to {filename}")
+
+# Usage example
+if __name__ == "__main__":
+    scraper = MaerskScraper()
+    scraper.scrape_announcements(max_load_more_clicks=1)
+    scraper.analyze_and_save_notices()
